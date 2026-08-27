@@ -157,6 +157,7 @@ namespace KuwaharaURP {
             builder.UseTexture(src,       AccessFlags.Read);
             builder.UseTexture(globalTex, AccessFlags.Read);
             builder.SetRenderAttachment(dst, 0, AccessFlags.Write);
+            builder.AllowGlobalStateModification(true);
             builder.SetRenderFunc(static (BlitData d, RasterGraphContext ctx) => {
                 ctx.cmd.SetGlobalTexture(d.tfmName, d.tfm);
                 Blitter.BlitTexture(ctx.cmd, d.src, new Vector4(1, 1, 0, 0), d.mat, d.pass);
