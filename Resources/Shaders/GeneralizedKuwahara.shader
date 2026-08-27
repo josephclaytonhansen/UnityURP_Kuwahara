@@ -4,127 +4,138 @@ Shader "Hidden/GeneralizedKuwahara" {
     }
 
     SubShader {
+        Tags { "RenderType" = "Opaque" }
+        Cull Off ZWrite Off ZTest Always
 
-        CGINCLUDE
-
-        #include "UnityCG.cginc"
-
-        struct VertexData {
-            float4 vertex : POSITION;
-            float2 uv : TEXCOORD0;
-        };
-
-        struct v2f {
-            float2 uv : TEXCOORD0;
-            float4 vertex : SV_POSITION;
-        };
-
-        v2f vp(VertexData v) {
-            v2f o;
-            o.vertex = UnityObjectToClipPos(v.vertex);
-            o.uv = v.uv;
-            return o;
-        }
-
-        #define PI 3.14159265358979323846f
-        
-        sampler2D _MainTex, _K0;
-        float4 _MainTex_TexelSize;
-        int _KernelSize, _N, _Size;
-        float _Hardness, _Q, _ZeroCrossing, _Zeta;
-
-        ENDCG
-        
         Pass {
-            CGPROGRAM
-            #pragma vertex vp
-            #pragma fragment fp
+            HLSLPROGRAM
+            #pragma vertex vert
+            #pragma fragment frag
 
-            float4 fp(v2f i) : SV_Target {
-                int k;
+            #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
+
+            struct Attributes {
+                float4 positionOS : POSITION;
+                float2 uv         : TEXCOORD0;
+            };
+
+            struct Varyings {
+                float4 positionCS : SV_POSITION;
+                float2 uv         : TEXCOORD0;
+            };
+
+            TEXTURE2D(_MainTex);
+            SAMPLER(sampler_MainTex);
+
+            CBUFFER_START(UnityPerMaterial)
+                float4 _MainTex_TexelSize;
+                int    _KernelSize;
+                int    _N;          // always 8
+                float  _Hardness;
+                float  _Q;
+                float  _ZeroCrossing;
+                float  _Zeta;
+            CBUFFER_END
+
+            Varyings vert(Attributes IN) {
+                Varyings OUT;
+                OUT.positionCS = TransformObjectToHClip(IN.positionOS.xyz);
+                OUT.uv         = IN.uv;
+                return OUT;
+            }
+
+            float4 frag(Varyings IN) : SV_Target {
+                // Precompute kernel constants once per pixel
+                int   kernelRadius = _KernelSize / 2;
+                float rcpRadius    = 1.0 / max(kernelRadius, 1);
+
+                float zeta        = _Zeta;
+                float zeroCross   = _ZeroCrossing;
+                float sinZC       = sin(zeroCross);
+                float eta         = (zeta + cos(zeroCross)) / (sinZC * sinZC);
+
+                // Rotated sub-sector: 45-degree rotation factor baked in
+                static const float ROT45 = 0.70710678118; // sqrt(2)/2
+
                 float4 m[8];
                 float3 s[8];
 
-                int kernelRadius = _KernelSize / 2;
-
-                //float zeta = 2.0f / (kernelRadius);
-                float zeta = _Zeta;
-
-                float zeroCross = _ZeroCrossing;
-                float sinZeroCross = sin(zeroCross);
-                float eta = (zeta + cos(zeroCross)) / (sinZeroCross * sinZeroCross);
-
-                for (k = 0; k < _N; ++k) {
-                    m[k] = 0.0f;
-                    s[k] = 0.0f;
+                UNITY_UNROLL
+                for (int k = 0; k < 8; ++k) {
+                    m[k] = 0.0;
+                    s[k] = 0.0;
                 }
 
-                [loop]
+                UNITY_LOOP
                 for (int y = -kernelRadius; y <= kernelRadius; ++y) {
-                    [loop]
+                    UNITY_LOOP
                     for (int x = -kernelRadius; x <= kernelRadius; ++x) {
-                        float2 v = float2(x, y) / kernelRadius;
-                        float3 c = tex2D(_MainTex, i.uv + float2(x, y) * _MainTex_TexelSize.xy).rgb;
+                        float2 v = float2(x, y) * rcpRadius;
+
+                        float3 c = SAMPLE_TEXTURE2D_LOD(
+                            _MainTex, sampler_MainTex,
+                            IN.uv + float2(x, y) * _MainTex_TexelSize.xy, 0).rgb;
                         c = saturate(c);
-                        float sum = 0;
-                        float w[8];
-                        float z, vxx, vyy;
-                        
-                        /* Calculate Polynomial Weights */
-                        vxx = zeta - eta * v.x * v.x;
-                        vyy = zeta - eta * v.y * v.y;
-                        z = max(0, v.y + vxx); 
-                        w[0] = z * z;
-                        sum += w[0];
-                        z = max(0, -v.x + vyy); 
-                        w[2] = z * z;
-                        sum += w[2];
-                        z = max(0, -v.y + vxx); 
-                        w[4] = z * z;
-                        sum += w[4];
-                        z = max(0, v.x + vyy); 
-                        w[6] = z * z;
-                        sum += w[6];
-                        v = sqrt(2.0f) / 2.0f * float2(v.x - v.y, v.x + v.y);
-                        vxx = zeta - eta * v.x * v.x;
-                        vyy = zeta - eta * v.y * v.y;
-                        z = max(0, v.y + vxx); 
-                        w[1] = z * z;
-                        sum += w[1];
-                        z = max(0, -v.x + vyy); 
-                        w[3] = z * z;
-                        sum += w[3];
-                        z = max(0, -v.y + vxx); 
-                        w[5] = z * z;
-                        sum += w[5];
-                        z = max(0, v.x + vyy); 
-                        w[7] = z * z;
-                        sum += w[7];
-                        
-                        float g = exp(-3.125f * dot(v,v)) / sum;
-                        
-                        for (int k = 0; k < 8; ++k) {
-                            float wk = w[k] * g;
-                            m[k] += float4(c * wk, wk);
-                            s[k] += c * c * wk;
-                        }
+
+                        // --- Axis-aligned sector weights (sectors 0,2,4,6) ---
+                        float vxx = zeta - eta * v.x * v.x;
+                        float vyy = zeta - eta * v.y * v.y;
+
+                        float z0 = max(0,  v.y + vxx); float w0 = z0 * z0;
+                        float z2 = max(0, -v.x + vyy); float w2 = z2 * z2;
+                        float z4 = max(0, -v.y + vxx); float w4 = z4 * z4;
+                        float z6 = max(0,  v.x + vyy); float w6 = z6 * z6;
+
+                        // --- Rotated sector weights (sectors 1,3,5,7) ---
+                        float2 vr  = ROT45 * float2(v.x - v.y, v.x + v.y);
+                        float vxxr = zeta - eta * vr.x * vr.x;
+                        float vyyr = zeta - eta * vr.y * vr.y;
+
+                        float z1 = max(0,  vr.y + vxxr); float w1 = z1 * z1;
+                        float z3 = max(0, -vr.x + vyyr); float w3 = z3 * z3;
+                        float z5 = max(0, -vr.y + vxxr); float w5 = z5 * z5;
+                        float z7 = max(0,  vr.x + vyyr); float w7 = z7 * z7;
+
+                        float sum = w0 + w1 + w2 + w3 + w4 + w5 + w6 + w7;
+
+                        // Gaussian uses rotated v (last computed v in original);
+                        // match original: exp(-3.125 * dot(vr,vr))
+                        float g = exp(-3.125 * dot(vr, vr)) / max(sum, 1e-6);
+
+                        float gw0 = w0 * g; m[0] += float4(c * gw0, gw0); s[0] += c * c * gw0;
+                        float gw1 = w1 * g; m[1] += float4(c * gw1, gw1); s[1] += c * c * gw1;
+                        float gw2 = w2 * g; m[2] += float4(c * gw2, gw2); s[2] += c * c * gw2;
+                        float gw3 = w3 * g; m[3] += float4(c * gw3, gw3); s[3] += c * c * gw3;
+                        float gw4 = w4 * g; m[4] += float4(c * gw4, gw4); s[4] += c * c * gw4;
+                        float gw5 = w5 * g; m[5] += float4(c * gw5, gw5); s[5] += c * c * gw5;
+                        float gw6 = w6 * g; m[6] += float4(c * gw6, gw6); s[6] += c * c * gw6;
+                        float gw7 = w7 * g; m[7] += float4(c * gw7, gw7); s[7] += c * c * gw7;
                     }
                 }
 
-                float4 output = 0;
-                for (k = 0; k < _N; ++k) {
-                    m[k].rgb /= m[k].w;
-                    s[k] = abs(s[k] / m[k].w - m[k].rgb * m[k].rgb);
+                float4 output = 0.0;
+                float hardness1000 = _Hardness * 1000.0;
+                float halfQ        = 0.5 * _Q;
 
-                    float sigma2 = s[k].r + s[k].g + s[k].b;
-                    float w = 1.0f / (1.0f + pow(_Hardness * 1000.0f * sigma2, 0.5f * _Q));
+                UNITY_UNROLL
+                for (int k = 0; k < 8; ++k) {
+                    float rcpW    = 1.0 / max(m[k].w, 1e-6);
+                    float3 mean   = m[k].rgb * rcpW;
+                    float3 var3   = abs(s[k] * rcpW - mean * mean);
+                    float  sigma2 = var3.r + var3.g + var3.b;
 
-                    output += float4(m[k].rgb * w, w);
+                    // pow(x, halfQ) where halfQ == 0.5*_Q: use sqrt only when Q≈1
+                    // General case: exp(halfQ * log(x)) is fine; the compiler may
+                    // already do this, but writing pow explicitly is cleaner.
+                    float wk = 1.0 / (1.0 + pow(hardness1000 * sigma2, halfQ));
+
+                    output += float4(mean * wk, wk);
                 }
 
                 return saturate(output / output.w);
             }
-            ENDCG
+
+            ENDHLSL
         }
     }
 }

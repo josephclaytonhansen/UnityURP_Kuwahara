@@ -1,184 +1,248 @@
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
+using UnityEngine.Rendering.RenderGraphModule;
 
 namespace KuwaharaURP {
-	[System.Serializable]
-	public sealed class KuwaharaEffectPass : ScriptableRenderPass {
-		RenderTargetIdentifier _source;
-		RenderTargetIdentifier _destinationA;
-		RenderTargetIdentifier _destinationB;
-		RenderTargetIdentifier _latestDest;
 
-		RenderTargetIdentifier _structureTensor;
-		RenderTargetIdentifier _eigenvectors1;
-		RenderTargetIdentifier _eigenvectors2;
+    [System.Serializable]
+    public sealed class KuwaharaEffectPass : ScriptableRenderPass {
 
-		readonly int _stensorID		  = Shader.PropertyToID("_StructureTensor");
-		readonly int _eigenvectors1ID = Shader.PropertyToID("_Eigenvectors1");
-		readonly int _eigenvectors2ID = Shader.PropertyToID("_Eigenvectors2");
+        // ---------------------------------------------------------------------------
+        // Fields
+        // ---------------------------------------------------------------------------
 
-		readonly int temporaryRTIdA   = Shader.PropertyToID("_TempRT");
-		readonly int temporaryRTIdB   = Shader.PropertyToID("_TempRTB");
+        Material           _effectMaterial;
+        KuwaharaEffectType _effectType;
 
-		Material		   _effectMaterial;
-		KuwaharaEffectType _effectType;
+        // Shader keyword strings must match the #pragma multi_compile_local in the shader
+        static readonly string KW_ANIMATE_SIZE   = "ANIMATE_SIZE";
+        static readonly string KW_ANIMATE_ORIGIN = "ANIMATE_ORIGIN";
 
-		public KuwaharaEffectPass() {
-			renderPassEvent = RenderPassEvent.BeforeRenderingPostProcessing;
-		}
+        public KuwaharaEffectPass() {
+            renderPassEvent = RenderPassEvent.BeforeRenderingPostProcessing;
+        }
 
-		public override void OnCameraSetup(CommandBuffer cmd, ref RenderingData renderingData) {
-			RenderTextureDescriptor descriptor = renderingData.cameraData.cameraTargetDescriptor;
-			descriptor.depthBufferBits = 0;
+        // ---------------------------------------------------------------------------
+        // Unity 6 – RenderGraph path
+        // ---------------------------------------------------------------------------
 
-			var renderer = renderingData.cameraData.renderer;
-			_source = renderer.cameraColorTarget;
+        public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData) {
+            var stack  = VolumeManager.instance.stack;
+            var effect = stack.GetComponent<KuwaharaEffectPPComponent>();
+            if (effect == null || !effect.IsActive()) return;
 
-			cmd.GetTemporaryRT(temporaryRTIdA, descriptor, FilterMode.Bilinear);
-			_destinationA = new RenderTargetIdentifier(temporaryRTIdA);
-			cmd.GetTemporaryRT(temporaryRTIdB, descriptor, FilterMode.Bilinear);
-			_destinationB = new RenderTargetIdentifier(temporaryRTIdB);
+            var resourceData = frameData.Get<UniversalResourceData>();
+            var cameraData   = frameData.Get<UniversalCameraData>();
 
-			var stack = VolumeManager.instance.stack;
-			var customEffect = stack.GetComponent<KuwaharaEffectPPComponent>();
-			if ( customEffect.IsActive() && customEffect.Enabled.value && customEffect.EffectType.value == KuwaharaEffectType.Anisotropic ) {
-				cmd.GetTemporaryRT(_stensorID, descriptor, FilterMode.Bilinear);
-				_structureTensor = new RenderTargetIdentifier(_stensorID);
+            // Skip scene-view cameras to avoid double-processing
+            if (cameraData.isSceneViewCamera) return;
 
-				cmd.GetTemporaryRT(_eigenvectors1ID, descriptor, FilterMode.Bilinear);
-				_eigenvectors1 = new RenderTargetIdentifier(_eigenvectors2ID);
+            RenderTextureDescriptor desc = cameraData.cameraTargetDescriptor;
+            desc.depthBufferBits = 0;
+            desc.msaaSamples     = 1;
 
-				cmd.GetTemporaryRT(_eigenvectors1ID, descriptor, FilterMode.Bilinear);
-				_eigenvectors2 = new RenderTargetIdentifier(_eigenvectors2ID);
-			}
-		}
+            TextureHandle source    = resourceData.activeColorTexture;
+            int           passCount = effect.Passes.value;
 
-		public override void Execute(ScriptableRenderContext context, ref RenderingData renderingData) {
-			if ( renderingData.cameraData.isSceneViewCamera ) {
-				return;
-			}
-			
-			CommandBuffer cmd = CommandBufferPool.Get("Custom Post Processing");
-			cmd.Clear();
+            switch (effect.EffectType.value) {
+                case KuwaharaEffectType.Basic:
+                    SetupBasic(effect);
+                    RunPingPong(renderGraph, source, desc, passCount, 0);
+                    break;
 
-			var stack = VolumeManager.instance.stack;
+                case KuwaharaEffectType.Generalized:
+                    SetupGeneralized(effect);
+                    RunPingPong(renderGraph, source, desc, passCount, 0);
+                    break;
 
-			#region Local Methods
-			void BlitTo(Material mat, int pass = 0) {
-				var first = _latestDest;
-				var last = first == _destinationA ? _destinationB : _destinationA;
-				Blit(cmd, first, last, mat, pass);
+                case KuwaharaEffectType.Anisotropic:
+                    SetupAnisotropic(effect);
+                    RunAnisotropic(renderGraph, source, desc, passCount);
+                    break;
+            }
+        }
 
-				_latestDest = last;
-			}
+        // ---------------------------------------------------------------------------
+        // Render helpers
+        // ---------------------------------------------------------------------------
 
-			void RenderPasses(int passCount) {
-				for ( int i = 0; i < passCount; ++i ) {
-					BlitTo(_effectMaterial);
-				}
-			}
+        /// Ping-pong between two temp RTs for <passCount> iterations, then copy back.
+        void RunPingPong(
+            RenderGraph rg, TextureHandle source,
+            RenderTextureDescriptor desc, int passCount, int shaderPass)
+        {
+            TextureHandle a = UniversalRenderer.CreateRenderGraphTexture(rg, desc, "_KuwTemp_A", false);
+            TextureHandle b = UniversalRenderer.CreateRenderGraphTexture(rg, desc, "_KuwTemp_B", false);
 
-			#endregion
+            // First pass always reads from source
+            AddBlitPass(rg, source, a, shaderPass);
 
-			_latestDest = _source;
-			var customEffect = stack.GetComponent<KuwaharaEffectPPComponent>();
+            for (int i = 1; i < passCount; i++) {
+                bool even = (i % 2) == 0;
+                AddBlitPass(rg, even ? b : a, even ? a : b, shaderPass);
+            }
 
-			if ( customEffect.IsActive() && customEffect.Enabled.value ) {
-				var passCount = customEffect.Passes.value;
-				switch ( customEffect.EffectType.value ) {
-					case KuwaharaEffectType.Basic:
-						SetupBasic(customEffect);
-						RenderPasses(passCount);
-						break;
-					case KuwaharaEffectType.Generalized:
-						SetupGeneralized(customEffect);
-						RenderPasses(passCount);
-						break;
-					case KuwaharaEffectType.Anisotropic:
-						SetupAnisotropic(customEffect);
-						Blit(cmd, _source, _structureTensor, _effectMaterial, 0);
-						Blit(cmd, _structureTensor, _eigenvectors1, _effectMaterial, 1);
-						Blit(cmd, _eigenvectors1, _eigenvectors2, _effectMaterial, 2);
-						cmd.SetGlobalTexture("_TFM", _eigenvectors2);
-						for ( int i = 0; i < passCount; ++i ) {
-							BlitTo(_effectMaterial, 3);
-						}
+            TextureHandle last = (passCount % 2 == 1) ? a : b;
+            AddCopyPass(rg, last, source);
+        }
 
-						break;
-				}
-			}
+        /// Full anisotropic pipeline: structure tensor → blur H → blur V+eigen → filter passes.
+        void RunAnisotropic(
+            RenderGraph rg, TextureHandle source,
+            RenderTextureDescriptor desc, int passCount)
+        {
+            TextureHandle stensor = UniversalRenderer.CreateRenderGraphTexture(rg, desc, "_KuwST",   false);
+            TextureHandle eigen1  = UniversalRenderer.CreateRenderGraphTexture(rg, desc, "_KuwEV1",  false);
+            TextureHandle eigen2  = UniversalRenderer.CreateRenderGraphTexture(rg, desc, "_KuwEV2",  false);
+            TextureHandle a       = UniversalRenderer.CreateRenderGraphTexture(rg, desc, "_KuwTemp_A", false);
+            TextureHandle b       = UniversalRenderer.CreateRenderGraphTexture(rg, desc, "_KuwTemp_B", false);
 
-			Blit(cmd, _latestDest, _source);
+            // Preprocessing
+            AddBlitPass(rg, source,  stensor, 0);   // structure tensor
+            AddBlitPass(rg, stensor, eigen1,  1);   // horizontal gaussian blur
+            AddBlitPass(rg, eigen1,  eigen2,  2);   // vertical gaussian blur + eigen decomp
 
-			context.ExecuteCommandBuffer(cmd);
-			CommandBufferPool.Release(cmd);
-		}
+            // Kuwahara filter passes; eigen2 is the TFM bound as a global texture
+            AddBlitPassWithGlobal(rg, source, a, 3, "_TFM", eigen2);
 
-		void SetupBasic(KuwaharaEffectPPComponent ppComponent) {
-			if ( _effectType != KuwaharaEffectType.Basic || !_effectMaterial ) {
-				if ( _effectMaterial ) {
-					Object.Destroy(_effectMaterial);
-				}
-				_effectMaterial = new Material(Resources.Load<Shader>("Shaders/Kuwahara"));
-				_effectType = ppComponent.EffectType.value;
-			}
-			
-			_effectMaterial.SetInt("_KernelSize", ppComponent.KernelSize.value);
-			_effectMaterial.SetInt("_MinKernelSize", ppComponent.MinKernelSize.value);
-			_effectMaterial.SetInt("_AnimateSize", ppComponent.AnimateKernelSize.value ? 1 : 0);
-			_effectMaterial.SetFloat("_SizeAnimationSpeed", ppComponent.SizeAnimationSpeed.value);
-			_effectMaterial.SetFloat("_NoiseFrequency", ppComponent.NoiseFrequency.value);
-			_effectMaterial.SetInt("_AnimateOrigin", ppComponent.AnimateKernelOrigin.value ? 1 : 0);
-		}
+            for (int i = 1; i < passCount; i++) {
+                bool even = (i % 2) == 0;
+                AddBlitPassWithGlobal(rg, even ? b : a, even ? a : b, 3, "_TFM", eigen2);
+            }
 
-		void SetupGeneralized(KuwaharaEffectPPComponent ppComponent) {
-			if ( _effectType != KuwaharaEffectType.Generalized || !_effectMaterial ) {
-				if ( _effectMaterial ) {
-					Object.Destroy(_effectMaterial);
-				}
-				_effectMaterial = new Material(Resources.Load<Shader>("Shaders/GeneralizedKuwahara"));
-				_effectType = ppComponent.EffectType.value;
-			}
-			_effectMaterial.SetInt("_KernelSize", ppComponent.KernelSize.value);
-			_effectMaterial.SetInt("_N", 8);
-			_effectMaterial.SetFloat("_Q", ppComponent.Sharpness.value);
-			_effectMaterial.SetFloat("_Hardness", ppComponent.Hardness.value);
-			_effectMaterial.SetFloat("_ZeroCrossing", ppComponent.ZeroCrossing.value);
-			_effectMaterial.SetFloat("_Zeta", ppComponent.UseZeta.value ? ppComponent.Zeta.value : 2.0f / (ppComponent.KernelSize.value / 2.0f));
-		}
+            TextureHandle last = (passCount % 2 == 1) ? a : b;
+            AddCopyPass(rg, last, source);
+        }
 
-		void SetupAnisotropic(KuwaharaEffectPPComponent ppComponent) {
-			if ( _effectType != KuwaharaEffectType.Anisotropic || !_effectMaterial ) {
-				if ( _effectMaterial ) {
-					Object.Destroy(_effectMaterial);
-				}
-				_effectMaterial = new Material(Resources.Load<Shader>("Shaders/AnisotropicKuwahara"));
-				_effectType = ppComponent.EffectType.value;
-			}
-			_effectMaterial.SetInt("_KernelSize", ppComponent.KernelSize.value);
-			_effectMaterial.SetInt("_N", 8);
-			_effectMaterial.SetFloat("_Q", ppComponent.Sharpness.value);
-			_effectMaterial.SetFloat("_Hardness", ppComponent.Hardness.value);
-			_effectMaterial.SetFloat("_ZeroCrossing", ppComponent.ZeroCrossing.value);
-			_effectMaterial.SetFloat("_Alpha", ppComponent.Alpha.value);
-			_effectMaterial.SetFloat("_Zeta", ppComponent.UseZeta.value ? ppComponent.Zeta.value : 2.0f / (ppComponent.KernelSize.value / 2.0f));
-		}
+        // ---------------------------------------------------------------------------
+        // RenderGraph pass builders
+        // ---------------------------------------------------------------------------
 
-		public override void OnCameraCleanup(CommandBuffer cmd) {
-			cmd.ReleaseTemporaryRT(temporaryRTIdA);
-			cmd.ReleaseTemporaryRT(temporaryRTIdB);
+        class BlitData {
+            public TextureHandle src;
+            public TextureHandle tfm;           // optional global texture
+            public string        tfmName;
+            public bool          hasTfm;
+            public Material      mat;
+            public int           pass;
+        }
 
-			cmd.ReleaseTemporaryRT(_stensorID);
-			cmd.ReleaseTemporaryRT(_eigenvectors1ID);
-			cmd.ReleaseTemporaryRT(_eigenvectors2ID);
-		}
+        void AddBlitPass(RenderGraph rg, TextureHandle src, TextureHandle dst, int shaderPass) {
+            using var builder = rg.AddRasterRenderPass<BlitData>("Kuwahara", out var data);
+            data.src    = src;
+            data.mat    = _effectMaterial;
+            data.pass   = shaderPass;
+            data.hasTfm = false;
 
-		public void DeInit() {
-			if ( _effectMaterial ) {
-				Object.Destroy( _effectMaterial );
-				_effectMaterial = null;
-			}
-		}
-	}
+            builder.UseTexture(src, AccessFlags.Read);
+            builder.SetRenderAttachment(dst, 0, AccessFlags.Write);
+            builder.SetRenderFunc(static (BlitData d, RasterGraphContext ctx) => {
+                Blitter.BlitTexture(ctx.cmd, d.src, new Vector4(1, 1, 0, 0), d.mat, d.pass);
+            });
+        }
+
+        void AddBlitPassWithGlobal(
+            RenderGraph rg, TextureHandle src, TextureHandle dst,
+            int shaderPass, string globalName, TextureHandle globalTex)
+        {
+            using var builder = rg.AddRasterRenderPass<BlitData>("Kuwahara+TFM", out var data);
+            data.src     = src;
+            data.tfm     = globalTex;
+            data.tfmName = globalName;
+            data.hasTfm  = true;
+            data.mat     = _effectMaterial;
+            data.pass    = shaderPass;
+
+            builder.UseTexture(src,       AccessFlags.Read);
+            builder.UseTexture(globalTex, AccessFlags.Read);
+            builder.SetRenderAttachment(dst, 0, AccessFlags.Write);
+            builder.SetRenderFunc(static (BlitData d, RasterGraphContext ctx) => {
+                ctx.cmd.SetGlobalTexture(d.tfmName, d.tfm);
+                Blitter.BlitTexture(ctx.cmd, d.src, new Vector4(1, 1, 0, 0), d.mat, d.pass);
+            });
+        }
+
+        class CopyData {
+            public TextureHandle src;
+        }
+
+        void AddCopyPass(RenderGraph rg, TextureHandle src, TextureHandle dst) {
+            using var builder = rg.AddRasterRenderPass<CopyData>("Kuwahara Copy-Back", out var data);
+            data.src = src;
+
+            builder.UseTexture(src, AccessFlags.Read);
+            builder.SetRenderAttachment(dst, 0, AccessFlags.Write);
+            builder.SetRenderFunc(static (CopyData d, RasterGraphContext ctx) => {
+                Blitter.BlitTexture(ctx.cmd, d.src, new Vector4(1, 1, 0, 0), 0, false);
+            });
+        }
+
+        // ---------------------------------------------------------------------------
+        // Material setup
+        // ---------------------------------------------------------------------------
+
+        void SetupBasic(KuwaharaEffectPPComponent c) {
+            EnsureMaterial(KuwaharaEffectType.Basic, "Shaders/Kuwahara");
+
+            // Use shader keywords instead of integer uniforms — avoids branching per pixel
+            SetKeyword(_effectMaterial, KW_ANIMATE_SIZE,   c.AnimateKernelSize.value);
+            SetKeyword(_effectMaterial, KW_ANIMATE_ORIGIN, c.AnimateKernelOrigin.value);
+
+            _effectMaterial.SetInt  ("_KernelSize",          c.KernelSize.value);
+            _effectMaterial.SetInt  ("_MinKernelSize",        c.MinKernelSize.value);
+            _effectMaterial.SetFloat("_SizeAnimationSpeed",   c.SizeAnimationSpeed.value);
+            _effectMaterial.SetFloat("_NoiseFrequency",       c.NoiseFrequency.value);
+        }
+
+        void SetupGeneralized(KuwaharaEffectPPComponent c) {
+            EnsureMaterial(KuwaharaEffectType.Generalized, "Shaders/GeneralizedKuwahara");
+
+            _effectMaterial.SetInt  ("_KernelSize",    c.KernelSize.value);
+            _effectMaterial.SetInt  ("_N",             8);
+            _effectMaterial.SetFloat("_Q",             c.Sharpness.value);
+            _effectMaterial.SetFloat("_Hardness",      c.Hardness.value);
+            _effectMaterial.SetFloat("_ZeroCrossing",  c.ZeroCrossing.value);
+            _effectMaterial.SetFloat("_Zeta",          c.UseZeta.value
+                                                        ? c.Zeta.value
+                                                        : 2f / (c.KernelSize.value / 2f));
+        }
+
+        void SetupAnisotropic(KuwaharaEffectPPComponent c) {
+            EnsureMaterial(KuwaharaEffectType.Anisotropic, "Shaders/AnisotropicKuwahara");
+
+            _effectMaterial.SetInt  ("_KernelSize",    c.KernelSize.value);
+            _effectMaterial.SetInt  ("_N",             8);
+            _effectMaterial.SetFloat("_Q",             c.Sharpness.value);
+            _effectMaterial.SetFloat("_Hardness",      c.Hardness.value);
+            _effectMaterial.SetFloat("_ZeroCrossing",  c.ZeroCrossing.value);
+            _effectMaterial.SetFloat("_Alpha",         c.Alpha.value);
+            _effectMaterial.SetFloat("_Zeta",          c.UseZeta.value
+                                                        ? c.Zeta.value
+                                                        : 2f / (c.KernelSize.value / 2f));
+        }
+
+        // ---------------------------------------------------------------------------
+        // Utilities
+        // ---------------------------------------------------------------------------
+
+        void EnsureMaterial(KuwaharaEffectType type, string shaderPath) {
+            if (_effectType == type && _effectMaterial) return;
+            if (_effectMaterial) Object.Destroy(_effectMaterial);
+            _effectMaterial = new Material(Resources.Load<Shader>(shaderPath));
+            _effectType     = type;
+        }
+
+        static void SetKeyword(Material mat, string keyword, bool enabled) {
+            if (enabled) mat.EnableKeyword(keyword);
+            else         mat.DisableKeyword(keyword);
+        }
+
+        public void DeInit() {
+            if (_effectMaterial) {
+                Object.Destroy(_effectMaterial);
+                _effectMaterial = null;
+            }
+        }
+    }
 }
